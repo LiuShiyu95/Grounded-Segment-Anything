@@ -25,13 +25,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # Recognize Anything Model & Tag2Text
-from ram.models import ram
+from ram.models import ram, ram_plus
 from ram import inference_ram
 import torchvision.transforms as TS
 
-# ChatGPT or nltk is required when using tags_chineses
-# import openai
-# import nltk
 
 def load_image(image_path):
     # load image
@@ -46,31 +43,6 @@ def load_image(image_path):
     )
     image, _ = transform(image_pil, None)  # 3, h, w
     return image_pil, image
-
-
-def check_tags_chinese(tags_chinese, pred_phrases, max_tokens=100, model="gpt-3.5-turbo"):
-    object_list = [obj.split('(')[0] for obj in pred_phrases]
-    object_num = []
-    for obj in set(object_list):
-        object_num.append(f'{object_list.count(obj)} {obj}')
-    object_num = ', '.join(object_num)
-    print(f"Correct object number: {object_num}")
-
-    if openai_key:
-        prompt = [
-            {
-                'role': 'system',
-                'content': 'Revise the number in the tags_chinese if it is wrong. ' + \
-                           f'tags_chinese: {tags_chinese}. ' + \
-                           f'True object number: {object_num}. ' + \
-                           'Only give the revised tags_chinese: '
-            }
-        ]
-        response = litellm.completion(model=model, messages=prompt, temperature=0.6, max_tokens=max_tokens)
-        reply = response['choices'][0]['message']['content']
-        # sometimes return with "tags_chinese: xxx, xxx, xxx"
-        tags_chinese = reply.split(':')[-1].strip()
-    return tags_chinese
 
 
 def load_model(model_config_path, model_checkpoint_path, device):
@@ -119,59 +91,12 @@ def get_grounding_output(model, image, caption, box_threshold, text_threshold,de
     return boxes_filt, torch.Tensor(scores), pred_phrases
 
 
-def show_mask(mask, ax, random_color=False):
-    if random_color:
-        color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
-    else:
-        color = np.array([30/255, 144/255, 255/255, 0.6])
-    h, w = mask.shape[-2:]
-    mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
-    ax.imshow(mask_image)
-
-
-def show_box(box, ax, label):
-    x0, y0 = box[0], box[1]
-    w, h = box[2] - box[0], box[3] - box[1]
-    ax.add_patch(plt.Rectangle((x0, y0), w, h, edgecolor='green', facecolor=(0,0,0,0), lw=2)) 
-    ax.text(x0, y0, label)
-
-
-def save_mask_data(output_dir, tags_chinese, mask_list, box_list, label_list):
-    value = 0  # 0 for background
-
-    mask_img = torch.zeros(mask_list.shape[-2:])
-    for idx, mask in enumerate(mask_list):
-        mask_img[mask.cpu().numpy()[0] == True] = value + idx + 1
-    plt.figure(figsize=(10, 10))
-    plt.imshow(mask_img.numpy())
-    plt.axis('off')
-    plt.savefig(os.path.join(output_dir, 'mask.jpg'), bbox_inches="tight", dpi=300, pad_inches=0.0)
-
-    json_data = {
-        'tags_chinese': tags_chinese,
-        'mask':[{
-            'value': value,
-            'label': 'background'
-        }]
-    }
-    for label, box in zip(label_list, box_list):
-        value += 1
-        name, logit = label.split('(')
-        logit = logit[:-1] # the last is ')'
-        json_data['mask'].append({
-            'value': value,
-            'label': name,
-            'logit': float(logit),
-            'box': box.numpy().tolist(),
-        })
-    with open(os.path.join(output_dir, 'label.json'), 'w') as f:
-        json.dump(json_data, f)
-    
 
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser("Grounded-Segment-Anything Demo", add_help=True)
     parser.add_argument("--config", type=str, required=True, help="path to config file")
+    parser.add_argument("--ram_version", type=str, required=True, help="ram version, like: ram or ram_plus")
     parser.add_argument(
         "--ram_checkpoint", type=str, required=True, help="path to checkpoint file"
     )
@@ -219,13 +144,7 @@ if __name__ == "__main__":
     iou_threshold = args.iou_threshold
     device = args.device
     
-    # ChatGPT or nltk is required when using tags_chineses
-    # openai.api_key = openai_key
-    # if openai_proxy:
-        # openai.proxy = {"http": openai_proxy, "https": openai_proxy}
-
-    # make dir
-    os.makedirs(output_dir, exist_ok=True)
+    
     # load image
     image_pil, image = load_image(image_path)
     # load model
@@ -243,11 +162,17 @@ if __name__ == "__main__":
                 ])
     
     # load model
-    ram_model = ram(pretrained=ram_checkpoint,
+    if args.ram_version == "ram":
+        ram_model = ram(pretrained=ram_checkpoint,
+                                            image_size=384,
+                                            vit='swin_l')
+    elif args.ram_version == "ram_plus":
+        ram_model = ram_plus(pretrained=ram_checkpoint,
                                         image_size=384,
                                         vit='swin_l')
-    # threshold for tagging
-    # we reduce the threshold to obtain more tags
+    else:
+        raise ValueError("ram_version can only be ram or ram_plus.")
+
     ram_model.eval()
 
     ram_model = ram_model.to(device)
@@ -260,19 +185,13 @@ if __name__ == "__main__":
     # Currently ", " is better for detecting single tags
     # while ". " is a little worse in some case
     tags=res[0].replace(' |', ',')
-    tags_chinese=res[1].replace(' |', ',')
-
-    print("Image Tags: ", res[0])
-    print("图像标签: ", res[1])
 
     # run grounding dino model
     boxes_filt, scores, pred_phrases = get_grounding_output(
         model, image, tags, box_threshold, text_threshold, device=device
     )
 
-    # initialize SAM
     if use_sam_hq:
-        print("Initialize SAM-HQ Predictor")
         predictor = SamPredictor(build_sam_hq(checkpoint=sam_hq_checkpoint).to(device))
     else:
         predictor = SamPredictor(build_sam(checkpoint=sam_checkpoint).to(device))
@@ -288,37 +207,32 @@ if __name__ == "__main__":
         boxes_filt[i][2:] += boxes_filt[i][:2]
 
     boxes_filt = boxes_filt.cpu()
-    # use NMS to handle overlapped boxes
-    print(f"Before NMS: {boxes_filt.shape[0]} boxes")
     nms_idx = torchvision.ops.nms(boxes_filt, scores, iou_threshold).numpy().tolist()
     boxes_filt = boxes_filt[nms_idx]
     pred_phrases = [pred_phrases[idx] for idx in nms_idx]
-    print(f"After NMS: {boxes_filt.shape[0]} boxes")
-    tags_chinese = check_tags_chinese(tags_chinese, pred_phrases)
-    print(f"Revise tags_chinese with number: {tags_chinese}")
 
-    transformed_boxes = predictor.transform.apply_boxes_torch(boxes_filt, image.shape[:2]).to(device)
-
-    masks, _, _ = predictor.predict_torch(
-        point_coords = None,
-        point_labels = None,
-        boxes = transformed_boxes.to(device),
-        multimask_output = False,
-    )
-    
-    # draw output image
-    plt.figure(figsize=(10, 10))
-    plt.imshow(image)
-    for mask in masks:
-        show_mask(mask.cpu().numpy(), plt.gca(), random_color=True)
+    innn = 0
+    crop_information_data_list = []
+    os.makedirs(f'{output_dir}/bbox', exist_ok=True)
     for box, label in zip(boxes_filt, pred_phrases):
-        show_box(box.numpy(), plt.gca(), label)
+        sx, sy, ex, ey = map(int, box)
+        sub_image = image[sy:ey, sx:ex]
+        bbox_list = [sx, sy, ex, ey]
+        output_path = f'{output_dir}/bbox/{innn:05}.jpg' 
+        innn += 1
+        sub_image_bgr = cv2.cvtColor(sub_image, cv2.COLOR_RGB2BGR) 
+        cv2.imwrite(output_path, sub_image_bgr)
+        label = label.split('(')[0]
+        new_data = {
+            'output_path': output_path,
+            'label': label,
+            'bbox_list': bbox_list,
+            'img_H': H,
+            'img_W': W
+        }
+        crop_information_data_list.append(new_data)
 
-    # plt.title('RAM-tags' + tags + '\n' + 'RAM-tags_chineseing: ' + tags_chinese + '\n')
-    plt.axis('off')
-    plt.savefig(
-        os.path.join(output_dir, "automatic_label_output.jpg"), 
-        bbox_inches="tight", dpi=300, pad_inches=0.0
-    )
+    output_json = f"{output_dir}/bbox.json"
 
-    save_mask_data(output_dir, tags_chinese, masks, boxes_filt, pred_phrases)
+    with open(output_json, 'w') as json_file:
+        json.dump(crop_information_data_list, json_file, indent=4)
